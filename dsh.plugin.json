@@ -1,0 +1,16 @@
+{
+  "id": "zzy6-a/dsh-prompt-enhance",
+  "version": "0.1.0",
+  "main": "./lib/index.js",
+  "description": "DSH composer prompt enhancer: one click rewrites your draft into a clearer, more complete task brief, with undo, rewrite styles, model routing and chip-aware guarding.",
+  "engines": {
+    "dsh": ">=0.1.5-rc.1"
+  },
+  "contributes": {
+    "tools": [],
+    "skills": []
+  },
+  "client": {
+    "main": "./lib/client.js"
+  }
+}

@@ -1,0 +1,6 @@
+# dsh-prompt-enhance bundle 层：插入「提示词增强」插件行。
+# 设置走 host 设置命名空间 `prompt-enhance`（见 README「设置」），这里不需要配置项。
+- insert:
+    - id: dsh-prompt-enhance
+      name: 'dsh-prompt-enhance'
+      config: {}
