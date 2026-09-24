@@ -7,7 +7,7 @@
 >
 > **Composer 里的一键提示词增强**——写完一句话，点一下 ✨，口语草稿被改写成目标明确、结构化的专业提示词，可一键撤销。
 
-## 与上游的差异（v0.2.0）
+## 与上游的差异（v0.2.0 起）
 
 **安全修复（3 项）**
 
@@ -105,8 +105,53 @@ cd ~/.dsh/profiles/web
 # 再建符号链接并重启 dsh web
 
 # 方式二：打包安装
-npm pack        # 产出 dsh-prompt-enhance-local-0.2.0.tgz
+npm pack        # 产出 dsh-prompt-enhance-local-<version>.tgz
 ```
+
+## 构建
+
+```bash
+npm run build   # host：scripts/build.sh（tsc）；client：tsdown
+```
+
+Windows 下没有 bash 时，等价的两条命令（本仓库实测）：
+
+```powershell
+node node_modules/typescript/bin/tsc -p tsconfig.json          # host → lib/index.js
+node node_modules/tsdown/dist/run.mjs                          # client → lib/client.js
+```
+
+host 半区改完**要重启 `dsh web`**（宿主按模块导入，不热更）；client 半区改完
+只需**刷新页面**：宿主每 500ms stat 一次 `lib/client.js`，重新哈希后自动换掉
+boot graph 里的 entry 版本（见 `@deepseek-ai/dsh-client-hmr`）。
+
+## 排障：整个 Web GUI 停在“Failed to load plugins”
+
+浏览器里 `HARNESS / Failed to load plugins / dsh-prompt-enhance-local /
+web boot: 1 entry did not activate / dsh-prompt-enhance-local: import failed`——
+**是 client bundle 的注册 id 与包名不一致**，与 host 半区无关。
+
+宿主为每个 `dsh.client` 包生成一行 boot entry，`entry id == 包名`；浏览器 Loader
+用这个 id 调 `loader.internal.import()`，而 bundle 只有在
+`window.__ModuleLoader__.load({ id })` 注册过同名 factory 时才解析得出来。注册成
+别的名字（例如 `dsh-prompt-enhance`）→ 找不到 factory → 该 entry 直接 FAILED →
+boot 审计拒绝启动 → 整个 UI 只剩 boot 页。
+
+已在 `tsdown.config.ts` 里把 id 从 `package.json#name` 派生（不再手写第二个名字），
+`test/client-bundle.test.mjs` 是第一道回归闸门。自检：
+
+```bash
+node --test test/client-bundle.test.mjs     # 断言注册 id == 包名 + externals 全在基座里
+node scripts/probe-boot-graph.mjs           # 只读线上探针：核对宿主实际发出去的 row / rev / 注册 id
+head -3 lib/client.js                       # 期望 id: "dsh-prompt-enhance-local"
+```
+
+`scripts/probe-boot-graph.mjs` 直接读宿主 SSE 通道 `/plugins/events`（`DSH_BASE=http://127.0.0.1:3081` 可换地址），
+逐项检查 boot graph 里有没有这一行、row 的构建代、combo 脚本里的注册 id、以及启动批次脚本是否 200——
+全是无副作用 GET，不会触发模型调用。要用宿主令牌才能拿到的 index 页面它不碰。
+
+host 半区是否活着，用 `node scripts/verify.mjs`（405/403/400/413 四道护栏）判断；
+它通过而 UI 仍然失败，问题一定在 client bundle。
 
 ## 安全边界（一句话版）
 

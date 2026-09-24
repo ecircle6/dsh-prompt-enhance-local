@@ -1,6 +1,6 @@
 {
   "id": "ecircle6/dsh-prompt-enhance-local",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "main": "./lib/index.js",
   "description": "Local hardened fork of dsh-prompt-enhance: one-click composer draft to structured prompt, undo, styles, chip-aware guard. Strict origin fence, no file writes, rate-limited.",
   "engines": {

@@ -6,7 +6,7 @@
 >
 > **One-click prompt enhancement in the DSH composer** — type a rough sentence, click ✨, get back a structured, unambiguous prompt; one-click undo.
 
-## What changed vs upstream (v0.2.0)
+## What changed vs upstream (v0.2.0 onward)
 
 **Security fixes**
 
@@ -47,6 +47,33 @@ node scripts/verify.mjs --rate   # additionally exercise the rate limiter
 ```
 
 Compatibility: DSH ≥ `0.1.5-rc.1` (verified locally 2026-09-24).
+
+## Build and troubleshooting
+
+```bash
+npm run build   # host: scripts/build.sh (tsc); client: tsdown
+```
+
+Windows without bash — the two equivalent commands:
+
+```powershell
+node node_modules/typescript/bin/tsc -p tsconfig.json   # host → lib/index.js
+node node_modules/tsdown/dist/run.mjs                   # client → lib/client.js
+```
+
+A host-half change needs a `dsh web` restart (the host imports it, nothing hot-reloads);
+a client-half change only needs a page refresh — the host stat-polls `lib/client.js`
+every 500ms and swaps the boot-graph entry revision itself.
+
+If the whole GUI stops at `Failed to load plugins / <pkg>: import failed (see console
+for the import error)`, the client bundle is registering under an id that differs from
+the **package name**. The host sets every `dsh.client` boot entry's `id` to the owning
+manifest's package name, and the browser Loader imports exactly that specifier, so a
+factory registered under any other id can never be resolved. This repository derives the
+registration id from `package.json#name` in `tsdown.config.ts`; `test/client-bundle.test.mjs`
+asserts it, and `node scripts/probe-boot-graph.mjs` checks what a running host actually
+serves (reads `/plugins/events`, read-only). If the host route answers `scripts/verify.mjs`
+but the UI still fails, the problem is the client bundle.
 
 ## Security boundary
 

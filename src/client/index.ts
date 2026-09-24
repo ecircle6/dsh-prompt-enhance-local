@@ -1,9 +1,16 @@
 /**
- * dsh-prompt-enhance — client 半区。
+ * dsh-prompt-enhance-local — client 半区。
  *
  * 在 composer 工具行注册一个小按钮，位置在 `conversation.input.right`（渲染出来
  * 紧贴模型选择器左侧）。点击 → 读当前草稿 → 调 host 一次性改写 → 整稿替换，
  * 并给出可撤销的入口（撤销按钮在草稿未被手动改动前一直可用）。
+ *
+ * 另注册设置分区 `settings.section`，读写 host 同名命名空间 `prompt-enhance-local`。
+ *
+ * 构建契约：本文件编译出的 `lib/client.js` 会被宿主按 **包名**
+ * （`dsh-prompt-enhance-local`）作为 boot graph 的 entry id 导入，注册 id 由
+ * `tsdown.config.ts` 从 package.json 派生——手写第二个名字会让宿主永远找不到
+ * 这个入口，整个 Web GUI 停在 “Failed to load plugins”。
  */
 import { createElement as h, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
