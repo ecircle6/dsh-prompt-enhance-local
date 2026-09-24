@@ -10,7 +10,7 @@ import { createElement as h, useCallback, useEffect, useMemo, useRef, useState }
 export const inject = ['slots', 'settingsScope']
 
 /** Host route served by this plugin's host half. */
-const ROUTE = '/api/dsh-prompt-enhance/enhance'
+const ROUTE = '/api/dsh-prompt-enhance-local/enhance'
 
 let warnedOnce = false
 
@@ -18,7 +18,7 @@ let warnedOnce = false
 export function apply(ctx: any): void {
   ctx.effect(() => ctx.slots.inject('conversation.input.right', () => ctx.slots.register({
     name: 'conversation.input.right',
-    id: 'prompt-enhance',
+    id: 'prompt-enhance-local',
     order: 10,
     inject: (sessionId: string) => ({
       /** Ask the host to rewrite one draft; resolves with the enhanced text. */
@@ -40,19 +40,19 @@ export function apply(ctx: any): void {
         return text
       },
     }),
-  }, PromptEnhanceSeat)), 'dsh-prompt-enhance: composer seat')
+  }, PromptEnhanceSeat)), 'dsh-prompt-enhance-local: composer seat')
 
-  // 设置：与 host 侧同名命名空间（prompt-enhance）的另一半——这里只做读写。
+  // 设置：与 host 侧同名命名空间（prompt-enhance-local）的另一半——这里只做读写。
   // 注册成独立分区（settings.section）：设置页左侧出现自己的「提示词增强」一项，
   // 而不是挤进插件配置 tab 里。
-  const scope = ctx.settingsScope.bind({ namespace: 'prompt-enhance' })
+  const scope = ctx.settingsScope.bind({ namespace: 'prompt-enhance-local' })
   ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
     name: 'settings.section',
-    id: 'prompt-enhance',
+    id: 'prompt-enhance-local',
     order: 100,
     label: () => '提示词增强',
     inject: () => ({ scope }),
-  }, SettingsSection)), 'dsh-prompt-enhance: settings section')
+  }, SettingsSection)), 'dsh-prompt-enhance-local: settings section')
 
   // 设置页左侧导航的图标由外壳按 section id 硬编码（未识别的 id 一律回退成齿轮），
   // 插件无法在注册时自带图标；这里用一次极轻的 DOM 装饰把齿轮换成 ✨：
@@ -85,7 +85,7 @@ export function apply(ctx: any): void {
     observer.observe(document.body, { childList: true, subtree: true })
     paint()
     return () => observer.disconnect()
-  }, 'dsh-prompt-enhance: settings nav icon')
+  }, 'dsh-prompt-enhance-local: settings nav icon')
 }
 
 /** Guard seat: renders nothing when the standard kit is unavailable (never breaks the composer). */
@@ -93,7 +93,7 @@ function PromptEnhanceSeat(props: any) {
   if (typeof props?.useInput !== 'function' || props?.inputActions === undefined) {
     if (!warnedOnce) {
       warnedOnce = true
-      console.warn('[dsh-prompt-enhance] conversation.input.right seat has no standard kit; button skipped')
+      console.warn('[dsh-prompt-enhance-local] conversation.input.right seat has no standard kit; button skipped')
     }
     return null
   }
@@ -191,7 +191,7 @@ function PromptEnhanceButton({ useInput, inputActions, enhanceDraft }: any) {
       'aria-label': '优化提示词',
       title: hasChips
         ? '当前草稿含文件引用 / 命令芯片，一键替换会切断这些引用——先去掉了再优化'
-        : (error !== '' ? `优化失败：${error}` : (empty ? '先输入内容再优化' : '优化提示词：补全细节、明确目标（一键替换）')),
+        : (error !== '' ? `优化失败：${error}` : (empty ? '先输入内容再优化' : '优化提示词（一键替换，可撤销）')),
       disabled,
       onClick: run,
       onMouseEnter: () => setHover(true),
@@ -233,21 +233,16 @@ function PromptEnhanceButton({ useInput, inputActions, enhanceDraft }: any) {
 /* ────────────────────────── 设置分区 ────────────────────────── */
 
 const STYLE_OPTIONS: Array<[string, string]> = [
-  ['default', '补全细节、明确目标（默认）'],
+  ['default', '补全细节、明确目标'],
   ['concise', '更简洁：删冗余，不加信息'],
   ['detailed', '更详细：补背景、做法要点与产出'],
   ['constraints', '加约束：写清边界与验收标准'],
-  ['structured', '结构化：目标 / 范围 / 产出 / 约束 / 验收'],
+  ['structured', '结构化：目标 / 范围 / 产出 / 约束 / 验收（默认）'],
 ]
 
 const MODEL_OPTIONS: Array<[string, string]> = [
   ['follow', '跟随当前会话'],
   ['fixed', '固定 provider / model'],
-]
-
-const EMPTY_OPTIONS: Array<[string, string]> = [
-  ['disable', '禁用按钮（需要你先写点内容）'],
-  ['context', '按最近对话生成一条提示词'],
 ]
 
 /** Rows keep the official settings-row rhythm; class hooks carry the interaction states. */
@@ -310,15 +305,6 @@ function checkGlyph() {
 function sectionRow(title: string, desc: string, control: unknown) {
   return h('div', { className: 'pe-row', key: title },
     h('div', { className: 'pe-rowText' },
-      h('div', { className: 'pe-title' }, title),
-      desc.length > 0 ? h('div', { className: 'pe-desc' }, desc) : null),
-    control)
-}
-
-/** One label-left / control-right row whose control spans the full width below. */
-function sectionField(title: string, desc: string, control: unknown) {
-  return h('div', { className: 'pe-field' },
-    h('div', null,
       h('div', { className: 'pe-title' }, title),
       desc.length > 0 ? h('div', { className: 'pe-desc' }, desc) : null),
     control)
@@ -402,12 +388,10 @@ function SettingsSection(props: any) {
   if (scope === undefined) return null
 
   const enabled = value.enabled !== false
-  const style = typeof value.style === 'string' ? value.style : 'default'
+  const style = typeof value.style === 'string' ? value.style : 'structured'
   const modelMode = typeof value.modelMode === 'string' ? value.modelMode : 'follow'
   const provider = typeof value.provider === 'string' ? value.provider : ''
   const model = typeof value.model === 'string' ? value.model : ''
-  const systemPrompt = typeof value.systemPrompt === 'string' ? value.systemPrompt : ''
-  const emptyDraft = typeof value.emptyDraft === 'string' ? value.emptyDraft : 'disable'
 
   const rows: unknown[] = [
     sectionRow('启用提示词增强按钮', '关闭后 composer 里的 ✨ 按钮不再出现。',
@@ -454,28 +438,12 @@ function SettingsSection(props: any) {
         }))))
   }
 
-  rows.push(
-    sectionRow('空草稿时', '草稿为空时按钮怎么表现。',
-      SectionSelect({
-        value: emptyDraft,
-        options: EMPTY_OPTIONS,
-        disabled: !enabled,
-        onChange: (next) => set('emptyDraft', next),
-      })),
-    sectionField('自定义提示词模板', '留空 = 用上面风格的模板；填写后完全覆盖（system 提示词）。',
-      h('textarea', {
-        className: 'pe-textarea',
-        placeholder: '留空使用内置模板',
-        value: systemPrompt,
-        disabled: !enabled,
-        onChange: (event: any) => set('systemPrompt', String(event.target.value)),
-      })))
 
   return h('div', { 'data-testid': 'prompt-enhance-settings', style: { padding: '4px 0 12px' } },
     h('div', { style: { marginBottom: 8 } },
       h('div', { style: { fontSize: 16, fontWeight: 600, lineHeight: '24px', color: 'var(--dsw-alias-label-primary, #111827)' } }, '提示词增强'),
       h('div', { className: 'pe-desc', style: { marginTop: 4 } },
-        'composer 输入框旁 ✨ 按钮的行为：改写风格、用哪个模型、空草稿怎么办。')),
+        'composer 输入框旁 ✨ 按钮的行为：改写风格与所用模型。')),
     rows)
 }
 

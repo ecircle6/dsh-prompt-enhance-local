@@ -1,7 +1,7 @@
 {
-  "name": "dsh-prompt-enhance",
-  "version": "0.1.0",
-  "description": "DSH 输入框旁的一键提示词增强：把口语化的一句话改写成目标明确、细节完整的任务说明，可一键撤销；五种改写风格、模型可跟随或固定，含 @引用/命令芯片时自动置灰保护。",
+  "name": "dsh-prompt-enhance-local",
+  "version": "0.2.0",
+  "description": "本地加固 fork（源自 zzy6-a/dsh-prompt-enhance，MIT）：输入框旁一键把口语草稿改写成结构化专业提示词，可撤销；五种风格、模型可跟随或固定、芯片置灰保护；零文件写入、严格 Origin 校验、内置限流。",
   "type": "module",
   "license": "MIT",
   "main": "./lib/index.js",
@@ -27,11 +27,11 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zzy6-a/dsh-prompt-enhance.git"
+    "url": "git+https://github.com/ecircle6/dsh-prompt-enhance-local.git"
   },
-  "homepage": "https://github.com/zzy6-a/dsh-prompt-enhance",
+  "homepage": "https://github.com/ecircle6/dsh-prompt-enhance-local",
   "bugs": {
-    "url": "https://github.com/zzy6-a/dsh-prompt-enhance/issues"
+    "url": "https://github.com/ecircle6/dsh-prompt-enhance-local/issues"
   },
   "keywords": [
     "deepseek",

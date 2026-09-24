@@ -1,28 +1,32 @@
 /**
- * dsh-prompt-enhance — host 半区。
+ * dsh-prompt-enhance-local — host 半区。
  *
- * 职责：暴露一条同源 HTTP 路由，接收 composer 草稿 → 用一次性 LLM 调用把说法
- * 改写得更清楚、补全关键细节 → 返回改写后的提示词。调用不落会话日志、不进
- * agent 上下文（hand-built 一次性调用）。
+ * 本仓库是 zzy6-a/dsh-prompt-enhance（MIT）的本地加固 fork，只做一件事：
+ * 把 composer 里的一句话草稿改写成目标明确、结构化的专业提示词。
  *
- * 设置命名空间 `prompt-enhance`（host 注册；client 设置卡片读写同一份）：
- *   enabled      总开关
- *   style        改写风格：default | concise | detailed | constraints | structured
- *   systemPrompt 自定义 system 模板（空 = 用风格内置模板）
- *   modelMode    模型：follow（跟随会话）| fixed（固定 provider/model）
- *   provider/model  fixed 模式下使用
- *   emptyDraft   空草稿行为：disable（置灰）| context（按最近对话生成）
+ * 相对上游的改动（见 README「与上游的差异」）：
+ *   - 删除：会话上下文生成（本插件不再读取 sessions）、自定义 system 模板、
+ *     空草稿策略（现在一律拒绝空草稿）、落盘诊断日志（改用宿主 logger，
+ *     对文件系统零写入）；
+ *   - 修复：Origin 校验的 startsWith 绕过（如 http://localhost.evil.com）、
+ *     强制要求 Origin 头、采纳 sec-fetch-site 提示、新增内存限流。
+ *
+ * 职责：暴露一条同源 HTTP 路由，接收 composer 草稿 → 用一次性 LLM 调用改写
+ * → 返回结果。调用不落会话日志、不进 agent 上下文（hand-built 一次性调用）。
+ *
+ * 设置命名空间 `prompt-enhance-local`（host 注册；client 设置卡片读写同一份）：
+ *   enabled        总开关
+ *   style          改写风格：default | concise | detailed | constraints | structured
+ *   modelMode      模型：follow（跟随会话）| fixed（固定 provider/model）
+ *   provider/model fixed 模式下使用
  */
-import { appendFileSync, mkdirSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import z from '@deepseek-ai/schemastery'
 
 // ── 本地最小结构面 ────────────────────────────────────────────────────────────
 // 本插件只用宿主服务的少数方法。这里自带最小声明，好处是构建只需一个 SDK
 // 依赖（schemastery，设置 schema），CI 不必安装整套 @deepseek-ai/* 运行时包；
-// 运行时的真实实例由宿主注入，结构兼容即可。
+// 运行时的真实实例由宿主注入，结构兼容即可——这也是抗 harness 更新的第一道防线。
 
 /** One exact-path HTTP route registered on the host web server. */
 interface WebRoute {
@@ -59,7 +63,6 @@ interface HostContext {
   llm: { stream(options: Record<string, unknown>): AsyncIterable<LlmChunk> }
   webServer: { register(route: WebRoute): () => void }
   settings: { register(namespace: string, schema: unknown): SettingsScopeFace<PromptEnhanceSettings> }
-  sessions: { get(id: string): { deriveMessages(): LlmMessage[] } | undefined }
 }
 
 /** Build one plain user message (the SDK's constructor is not a runtime dependency here). */
@@ -72,11 +75,11 @@ function createUserMessage(input: { source: { kind: 'user' }; content: Array<{ t
   }
 }
 
-export const name = 'dsh-prompt-enhance'
-export const inject = ['webServer', 'llm', 'settings', 'sessions']
+export const name = 'dsh-prompt-enhance-local'
+export const inject = ['webServer', 'llm', 'settings']
 
 /** Exact-path route serving the client button. */
-const ROUTE_PATH = '/api/dsh-prompt-enhance/enhance'
+const ROUTE_PATH = '/api/dsh-prompt-enhance-local/enhance'
 /** Request body cap (a draft is small; anything larger is a misuse). */
 const MAX_BODY_BYTES = 64 * 1024
 /** Draft cap handed to the model. */
@@ -84,7 +87,13 @@ const MAX_DRAFT_CHARS = 12000
 /** End-to-end deadline for one enhancement call. */
 const TIMEOUT_MS = 90_000
 /** Settings namespace shared with the client card. */
-export const SETTINGS_NS = 'prompt-enhance'
+export const SETTINGS_NS = 'prompt-enhance-local'
+/** Rate limit: enhancement calls allowed per window (per process, in-memory). */
+const RATE_LIMIT = 10
+const RATE_WINDOW_MS = 60_000
+
+/** Exact loopback hostnames allowed as an Origin host (no prefix matching — see README). */
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
 
 /** Common rewrite policy shared by every style. */
 const BASE_RULES = [
@@ -126,47 +135,30 @@ const STYLE_PROMPTS: Record<string, string> = {
 }
 
 /**
- * Compose the rewrite system prompt: a custom template wins outright, otherwise the
- * shared base rules plus the selected style instruction.
+ * Compose the rewrite system prompt: base rules + the selected style instruction.
  * @param style - settings style id (unknown ids fall back to `default`).
- * @param custom - user-provided system template (empty = use the built-in one).
  * @returns the system prompt text.
  */
-export function buildSystemPrompt(style: string, custom: string): string {
-  if (custom.trim().length > 0) return custom
+export function buildSystemPrompt(style: string): string {
   const body = STYLE_PROMPTS[style] ?? STYLE_PROMPTS.default
   return BASE_RULES + '\n' + body
 }
-
-/** Style used when the user drafts nothing and the setting asks for context-derived prompts. */
-const CONTEXT_SYSTEM = [
-  '你是提示词生成器。用户还没有写任何需求，只提供了当前会话最近的对话内容。',
-  '你的唯一任务：根据这段上下文，推测用户接下来最可能想让你做的事，并生成一条完整、明确的提示词。',
-  '规则：',
-  '1. 只依据上下文里已经出现的目标、文件、问题来写，不要凭空发明新任务。',
-  '2. 直接输出提示词正文，不要解释、不要用代码围栏包起来。',
-  '3. 一到三句话即可。',
-].join('\n')
 
 /** Settings shape owned by this plugin (defaults are the shipped behavior). */
 export interface PromptEnhanceSettings {
   enabled: boolean
   style: string
-  systemPrompt: string
   modelMode: string
   provider: string
   model: string
-  emptyDraft: string
 }
 
 export const SettingsSchema = z.object({
   enabled: z.boolean().default(true),
-  style: z.union(['default', 'concise', 'detailed', 'constraints', 'structured']).default('default'),
-  systemPrompt: z.string().default(''),
+  style: z.union(['default', 'concise', 'detailed', 'constraints', 'structured']).default('structured'),
   modelMode: z.union(['follow', 'fixed']).default('follow'),
   provider: z.string().default(''),
   model: z.string().default(''),
-  emptyDraft: z.union(['disable', 'context']).default('disable'),
 })
 
 /** Default-model service face (optional: not every deployment mounts it). */
@@ -174,20 +166,10 @@ interface DefaultModelFace {
   currentSelection(): { provider: string; model: string }
 }
 
-const LOG_FILE = join(process.env.DSH_HOME ?? join(homedir(), '.dsh'), 'super-injector', 'dsh-prompt-enhance.log')
-
-/** Append one diagnostic line (never throws). */
-function logLine(text: string): void {
-  try {
-    mkdirSync(dirname(LOG_FILE), { recursive: true })
-    appendFileSync(LOG_FILE, '[' + new Date().toISOString() + '] ' + text + '\n')
-  } catch { /* diagnostics must not break the route */ }
-}
-
 /** Read the optional default-model service without a hard inject dependency. */
 function readDefaultRoute(ctx: HostContext): { provider: string; model: string } | undefined {
   try {
-    const getter = (ctx as unknown as { get?(name: string): unknown }).get
+    const getter = ctx.get
     if (typeof getter !== 'function') return undefined
     const face = getter.call(ctx, 'agentDefaultModel') as DefaultModelFace | undefined
     return face?.currentSelection()
@@ -225,16 +207,77 @@ async function readJsonBody(req: IncomingMessage): Promise<Record<string, unknow
   }
 }
 
-/** Loopback-or-same-origin fence: the browser calls this from the served page. */
-export function sameOriginAllowed(req: IncomingMessage): boolean {
-  const origin = req.headers.origin
-  if (typeof origin !== 'string' || origin.length === 0) return true
+/** Hostname of a Host header value such as `127.0.0.1:3080` ('' when unparsable). */
+function hostHeaderHostname(hostHeader: string): string {
   try {
-    const host = new URL(origin).host
-    if (host === req.headers.host) return true
-    return host.startsWith('127.0.0.1') || host.startsWith('localhost') || host.startsWith('[::1]')
+    return new URL('http://' + hostHeader).hostname.toLowerCase()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Request fence for the enhance route: the browser must prove the call came from
+ * the page this server itself serves.
+ *
+ * Rules (all must hold):
+ *   1. An Origin header is REQUIRED and must parse as http(s) — bare requests
+ *      (curl without headers, stray processes) are rejected;
+ *   2. The Origin hostname must be an EXACT loopback match, or exactly equal to
+ *      the request's Host hostname (same-host deployments, e.g. LAN access).
+ *      Prefix matching is deliberately NOT used: upstream allowed
+ *      `http://localhost.evil.com` via startsWith('localhost');
+ *   3. When the browser sends `sec-fetch-site`, it must be `same-origin`
+ *      (absent header falls back to rules 1–2 only).
+ *
+ * Residual risk (documented): a local process can forge every one of these
+ * headers — loopback HTTP has no real authentication (the DSH GUI itself has
+ * none). The in-memory rate limit below caps abuse at a bounded call rate.
+ */
+export function originAllowed(req: Pick<IncomingMessage, 'headers'>): boolean {
+  const origin = req.headers.origin
+  if (typeof origin !== 'string' || origin.length === 0) return false
+  let originHost: string
+  let protocol: string
+  try {
+    const url = new URL(origin)
+    originHost = url.hostname.toLowerCase()
+    protocol = url.protocol
   } catch {
     return false
+  }
+  if (protocol !== 'http:' && protocol !== 'https:') return false
+  if (!LOOPBACK_HOSTS.has(originHost)) {
+    const hostHeader = typeof req.headers.host === 'string' ? req.headers.host : ''
+    if (hostHeader.length === 0) return false
+    if (hostHeaderHostname(hostHeader) !== originHost) return false
+  }
+  const site = req.headers['sec-fetch-site']
+  if (typeof site === 'string' && site.length > 0 && site !== 'same-origin') return false
+  return true
+}
+
+/**
+ * Fixed-window in-memory rate limiter (no dependencies, no state on disk).
+ * @param options.limit - calls allowed per window.
+ * @param options.windowMs - window length in milliseconds.
+ * @param options.now - injectable clock for tests (defaults to Date.now).
+ * @returns a limiter whose `allow()` reports whether this call may proceed.
+ */
+export function createRateLimiter(options: { limit: number; windowMs: number; now?: () => number }): { allow(): boolean } {
+  const now = options.now ?? Date.now
+  let windowStart = now()
+  let count = 0
+  return {
+    allow(): boolean {
+      const at = now()
+      if (at - windowStart >= options.windowMs) {
+        windowStart = at
+        count = 0
+      }
+      count += 1
+      return count <= options.limit
+    },
   }
 }
 
@@ -245,18 +288,9 @@ export function stripFence(text: string): string {
   return match?.[1] !== undefined ? match[1].trim() : trimmed
 }
 
-/** Clipboard-ish text of one derived message (text blocks only). */
-function messageText(message: LlmMessage): string {
-  const blocks = message.content ?? []
-  return blocks
-    .filter((block) => block?.type === 'text' && typeof block.text === 'string')
-    .map((block) => block.text as string)
-    .join('\n')
-    .trim()
-}
-
 export function apply(ctx: HostContext): void {
   const settings = ctx.settings.register(SETTINGS_NS, SettingsSchema)
+  const limiter = createRateLimiter({ limit: RATE_LIMIT, windowMs: RATE_WINDOW_MS })
 
   /** Most recent main-model route, captured off the llm waterfall (auxiliary purposes excluded). */
   let lastRoute: { provider: string; model: string } | undefined
@@ -265,21 +299,6 @@ export function apply(ctx: HostContext): void {
     return next()
   })
 
-  /** Recent human context of one session (used by the emptyDraft=context mode). */
-  function recentContext(sessionId: unknown, turns: number): string {
-    if (typeof sessionId !== 'string' || sessionId.length === 0) return ''
-    try {
-      const session = ctx.sessions.get(sessionId as never)
-      if (session === undefined) return ''
-      const messages = session.deriveMessages()
-      const human = messages.filter((message) => (message as unknown as { role?: string }).role === 'user')
-      return human.slice(-turns).map(messageText).filter((text) => text.length > 0).join('\n---\n').slice(0, 4000)
-    } catch (error) {
-      logLine('recentContext failed: ' + String(error))
-      return ''
-    }
-  }
-
   const route: WebRoute = {
     kind: 'exact',
     path: ROUTE_PATH,
@@ -287,7 +306,7 @@ export function apply(ctx: HostContext): void {
       try {
         await handle(req, res)
       } catch (error) {
-        logLine('handler error: ' + (error instanceof Error ? (error.stack ?? error.message) : String(error)))
+        ctx.logger?.warn?.('[dsh-prompt-enhance-local] handler error: ' + (error instanceof Error ? (error.stack ?? error.message) : String(error)))
         if (!res.headersSent) sendJson(res, 500, { ok: false, error: error instanceof Error ? error.message : String(error) })
         else res.destroy()
       }
@@ -300,8 +319,12 @@ export function apply(ctx: HostContext): void {
       sendJson(res, 405, { ok: false, error: 'method not allowed' })
       return
     }
-    if (!sameOriginAllowed(req)) {
+    if (!originAllowed(req)) {
       sendJson(res, 403, { ok: false, error: 'forbidden origin' })
+      return
+    }
+    if (!limiter.allow()) {
+      sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
       return
     }
     const config = settings.get() as PromptEnhanceSettings
@@ -311,8 +334,7 @@ export function apply(ctx: HostContext): void {
     }
     const body = await readJsonBody(req)
     const draft = typeof body?.draft === 'string' ? body.draft.trim() : ''
-    const useContext = draft.length === 0 && config.emptyDraft === 'context'
-    if (draft.length === 0 && !useContext) {
+    if (draft.length === 0) {
       sendJson(res, 400, { ok: false, error: '草稿为空' })
       return
     }
@@ -331,17 +353,7 @@ export function apply(ctx: HostContext): void {
       return
     }
 
-    // Prompt: a custom system template wins over the per-style built-in.
-    const system = useContext ? CONTEXT_SYSTEM : buildSystemPrompt(config.style, config.systemPrompt)
-    const context = useContext ? recentContext(body?.sessionId, 2) : ''
-    if (useContext && context.length === 0) {
-      sendJson(res, 422, { ok: false, error: '没有可用的上下文，请先输入内容' })
-      return
-    }
-    const prompt = useContext
-      ? '以下是当前会话最近的对话内容：\n\n' + context + '\n\n请据此生成一条明确的提示词。'
-      : draft
-
+    const system = buildSystemPrompt(config.style)
     const controller = new AbortController()
     const timer = setTimeout(() => { controller.abort() }, TIMEOUT_MS)
     let text = ''
@@ -350,7 +362,7 @@ export function apply(ctx: HostContext): void {
         provider: selected.provider,
         model: selected.model,
         system,
-        messages: [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: prompt }] })],
+        messages: [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: draft }] })],
         temperature: 0.3,
         maxTokens: 1500,
         signal: controller.signal,
@@ -369,9 +381,9 @@ export function apply(ctx: HostContext): void {
       sendJson(res, 502, { ok: false, error: '模型没有返回内容' })
       return
     }
-    sendJson(res, 200, { ok: true, text: result, route: selected, style: config.style, fromContext: useContext })
+    sendJson(res, 200, { ok: true, text: result, route: selected, style: config.style })
   }
 
-  ctx.effect(() => ctx.webServer.register(route), 'dsh-prompt-enhance: enhance route')
-  ctx.logger?.info?.('[dsh-prompt-enhance] route ready: POST ' + ROUTE_PATH)
+  ctx.effect(() => ctx.webServer.register(route), 'dsh-prompt-enhance-local: enhance route')
+  ctx.logger?.info?.('[dsh-prompt-enhance-local] route ready: POST ' + ROUTE_PATH)
 }
