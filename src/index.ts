@@ -49,7 +49,7 @@ interface LlmChunk {
   text?: string
 }
 
-/** Settings scope face owned by the host settings provider. */
+/** Legacy settings face: a host that binds plugin settings by namespace returns one. */
 interface SettingsScopeFace<T> {
   get(): T
 }
@@ -62,7 +62,13 @@ interface HostContext {
   get?(name: string): unknown
   llm: { stream(options: Record<string, unknown>): AsyncIterable<LlmChunk> }
   webServer: { register(route: WebRoute): () => void }
-  settings: { register(namespace: string, schema: unknown): SettingsScopeFace<PromptEnhanceSettings> }
+  /**
+   * The namespace-bound settings scope, on hosts that still offer one. Declared
+   * optional and read through `ctx.get('settings')` rather than injected: the
+   * service name survives across hosts but its shape does not, and a hard
+   * injection would refuse to boot this plugin where that shape changed.
+   */
+  settings?: { register?(namespace: string, schema: unknown): SettingsScopeFace<Partial<PromptEnhanceSettings>> }
 }
 
 /** Build one plain user message (the SDK's constructor is not a runtime dependency here). */
@@ -76,7 +82,13 @@ function createUserMessage(input: { source: { kind: 'user' }; content: Array<{ t
 }
 
 export const name = 'dsh-prompt-enhance-local'
-export const inject = ['webServer', 'llm', 'settings']
+/**
+ * Services this plugin cannot work without. `settings` is deliberately absent:
+ * hosts disagree on its shape, so configuration is resolved through
+ * `ctx.get('settings')` with a Loader-row fallback (see `createSettingsReader`)
+ * instead of gating the mount on a service whose API may have changed.
+ */
+export const inject = ['webServer', 'llm']
 
 /** Exact-path route serving the client button. */
 const ROUTE_PATH = '/api/dsh-prompt-enhance-local/enhance'
@@ -153,13 +165,55 @@ export interface PromptEnhanceSettings {
   model: string
 }
 
+/** Shipped defaults: the schema's defaults and the fallback when a host passes no row config. */
+export const DEFAULT_SETTINGS = {
+  enabled: true,
+  style: 'structured',
+  modelMode: 'follow',
+  provider: '',
+  model: '',
+} as const satisfies PromptEnhanceSettings
+
+/**
+ * Mark one config field live-editable for the host's generated settings form.
+ *
+ * The method spelling is not portable: the host vendors schemastery 3.18.5
+ * (`volatile()`), while this package's pinned 3.18.2 has no such method — and
+ * bumping the pin would tie the plugin to one dependency release for a single
+ * flag. The host's form projection reads `meta.volatile` either way
+ * (`settings/schema.ts` → `volatileForm`), so set that flag, preferring the
+ * method when the installed build provides it.
+ *
+ * @param schema - one field schema.
+ * @returns the same schema, marked live-editable.
+ */
+function live<T extends object>(schema: T): T {
+  const candidate = schema as { volatile?: () => unknown; meta?: Record<string, unknown> }
+  if (typeof candidate.volatile === 'function') {
+    candidate.volatile()
+    return schema
+  }
+  if (candidate.meta !== undefined) candidate.meta.volatile = true
+  return schema
+}
+
 export const SettingsSchema = z.object({
-  enabled: z.boolean().default(true),
-  style: z.union(['default', 'concise', 'detailed', 'constraints', 'structured']).default('structured'),
-  modelMode: z.union(['follow', 'fixed']).default('follow'),
-  provider: z.string().default(''),
-  model: z.string().default(''),
+  enabled: live(z.boolean().default(DEFAULT_SETTINGS.enabled)),
+  style: live(z.union(['default', 'concise', 'detailed', 'constraints', 'structured']).default(DEFAULT_SETTINGS.style)),
+  modelMode: live(z.union(['follow', 'fixed']).default(DEFAULT_SETTINGS.modelMode)),
+  provider: live(z.string().default(DEFAULT_SETTINGS.provider)),
+  model: live(z.string().default(DEFAULT_SETTINGS.model)),
 })
+
+/**
+ * Loader-row configuration schema.
+ *
+ * A host that keeps plugin configuration in the Loader row validates the row's
+ * `config` against this export and offers it as a settings form; a host with a
+ * namespace settings scope uses {@link SettingsSchema} through
+ * `settings.register` instead. Both paths read the same fields.
+ */
+export const Config = SettingsSchema
 
 /** Default-model service face (optional: not every deployment mounts it). */
 interface DefaultModelFace {
@@ -288,8 +342,49 @@ export function stripFence(text: string): string {
   return match?.[1] !== undefined ? match[1].trim() : trimmed
 }
 
-export function apply(ctx: HostContext): void {
-  const settings = ctx.settings.register(SETTINGS_NS, SettingsSchema)
+/**
+ * Merge a partial configuration onto the shipped defaults.
+ * @param value - values from a host settings scope or the Loader row.
+ * @returns the complete settings object the request path reads.
+ */
+function withDefaults(value: Partial<PromptEnhanceSettings> | undefined): PromptEnhanceSettings {
+  return { ...DEFAULT_SETTINGS, ...(value ?? {}) }
+}
+
+/**
+ * Resolve how this host exposes plugin configuration — by capability, not by version.
+ *
+ * A host that binds settings by namespace answers `register(namespace, schema)`
+ * with a live scope; a host that keeps plugin configuration in the Loader row
+ * offers no such method and hands that row's config to `apply` instead. Both are
+ * read through one accessor, and a host offering neither still serves the
+ * shipped defaults. This replaces a hard `settings.register(...)` call that threw
+ * where the settings service changed shape, which stopped the whole plugin from
+ * loading instead of degrading a single feature.
+ *
+ * @param ctx - host plugin context.
+ * @param rowConfig - the Loader row's configuration, when the host passes it.
+ * @returns an accessor evaluated per request, so live edits are seen.
+ */
+function createSettingsReader(
+  ctx: HostContext,
+  rowConfig: Partial<PromptEnhanceSettings> | undefined,
+): () => PromptEnhanceSettings {
+  const service = ctx.get?.('settings') as HostContext['settings'] | undefined
+  const register = service?.register
+  if (typeof register === 'function') {
+    try {
+      const scope = register.call(service, SETTINGS_NS, SettingsSchema)
+      if (scope !== undefined && typeof scope.get === 'function') return () => withDefaults(scope.get())
+    } catch {
+      // A host refusing the namespace binding falls through to the row config.
+    }
+  }
+  return () => withDefaults(rowConfig)
+}
+
+export function apply(ctx: HostContext, rowConfig?: Partial<PromptEnhanceSettings>): void {
+  const readSettings = createSettingsReader(ctx, rowConfig)
   const limiter = createRateLimiter({ limit: RATE_LIMIT, windowMs: RATE_WINDOW_MS })
 
   /** Most recent main-model route, captured off the llm waterfall (auxiliary purposes excluded). */
@@ -327,7 +422,7 @@ export function apply(ctx: HostContext): void {
       sendJson(res, 429, { ok: false, error: '请求过于频繁，请稍后再试' })
       return
     }
-    const config = settings.get() as PromptEnhanceSettings
+    const config = readSettings()
     if (config.enabled !== true) {
       sendJson(res, 403, { ok: false, error: '提示词增强已在设置中关闭' })
       return

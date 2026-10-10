@@ -14,12 +14,35 @@
  */
 import { createElement as h, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-export const inject = ['slots', 'settingsScope']
+export const inject = ['slots']
 
 /** Host route served by this plugin's host half. */
 const ROUTE = '/api/dsh-prompt-enhance-local/enhance'
 
 let warnedOnce = false
+
+/**
+ * Resolve the settings face this host offers, if any.
+ *
+ * Settings access changed shape across harness generations: hosts that bind
+ * settings by namespace expose `ctx.settingsScope.bind(spec)`, while newer hosts
+ * keep plugin configuration in the Loader row and expose no scope at all. The
+ * face is probed at runtime rather than injected, so a host without one simply
+ * does not get this page — its configuration form covers the same fields —
+ * instead of the whole browser half never activating.
+ *
+ * @param ctx - client plugin context.
+ * @returns the bound scope, or undefined when this host offers none.
+ */
+function resolveSettingsFace(ctx: any): any {
+  try {
+    const binder = ctx.get?.('settingsScope')
+    if (typeof binder?.bind === 'function') return binder.bind({ namespace: 'prompt-enhance-local' })
+  } catch {
+    // A host exposing a different shape counts as "no face here".
+  }
+  return undefined
+}
 
 /** Register the composer button on the right tool-row cluster (before the model seat). */
 export function apply(ctx: any): void {
@@ -50,22 +73,28 @@ export function apply(ctx: any): void {
   }, PromptEnhanceSeat)), 'dsh-prompt-enhance-local: composer seat')
 
   // 设置：与 host 侧同名命名空间（prompt-enhance-local）的另一半——这里只做读写。
-  // 注册成独立分区（settings.section）：设置页左侧出现自己的「提示词增强」一项，
-  // 而不是挤进插件配置 tab 里。
-  const scope = ctx.settingsScope.bind({ namespace: 'prompt-enhance-local' })
-  ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
-    name: 'settings.section',
-    id: 'prompt-enhance-local',
-    order: 100,
-    label: () => '提示词增强',
-    inject: () => ({ scope }),
-  }, SettingsSection)), 'dsh-prompt-enhance-local: settings section')
+  // 只有该宿主真的提供设置作用域时才注册这一页：新版 harness 已移除
+  // `ctx.settingsScope`，插件配置改由「Loader 行配置 + 官方自动表单」承担
+  // （host 半区导出 Config 即是那份 schema），因此这里探测不到就静默跳过，
+  // 而不是让整个浏览器半区因为缺少注入服务而永不激活。
+  const scope = resolveSettingsFace(ctx)
+  if (scope !== undefined) {
+    ctx.effect(() => ctx.slots.inject('settings.section', () => ctx.slots.register({
+      name: 'settings.section',
+      id: 'prompt-enhance-local',
+      order: 100,
+      label: () => '提示词增强',
+      inject: () => ({ scope }),
+    }, SettingsSection)), 'dsh-prompt-enhance-local: settings section')
+  }
 
   // 设置页左侧导航的图标由外壳按 section id 硬编码（未识别的 id 一律回退成齿轮），
   // 插件无法在注册时自带图标；这里用一次极轻的 DOM 装饰把齿轮换成 ✨：
   // 找到文本为「提示词增强」的导航项 → 隐藏它的 svg → 前面插一个 ✨。
   // 纯装饰：任何一步失败都只是"还是齿轮"，不影响功能与注册。
   ctx.effect(() => {
+    // Only meaningful while this plugin owns a row in that nav list.
+    if (scope === undefined) return () => {}
     let queued = false
     const paint = (): void => {
       queued = false

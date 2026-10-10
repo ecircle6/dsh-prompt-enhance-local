@@ -126,23 +126,26 @@ test('materializing the bundle resolves its externals from the platform table an
   const exports_ = registrations[0].factory(resolve)
   assert.deepEqual([...requested], ['react'], 'the only bare external may be a platform module')
   assert.equal(typeof exports_.apply, 'function')
-  assert.deepEqual([...exports_.inject], ['slots', 'settingsScope'])
+  assert.deepEqual([...exports_.inject], ['slots'])
 })
 
-test('apply registers the composer seat and the settings section, then disposes cleanly', () => {
+test('apply registers the composer seat and the settings section on a host that offers a settings scope', () => {
   const { registrations, resolve } = loadClientBundle()
   const exports_ = registrations[0].factory(resolve)
   const disposers = []
   const injected = []
   const registered = []
+  const settingsScope = {
+    bind: (spec) => ({ spec, getSnapshot: () => ({ status: 'ready', value: {} }), subscribe: () => () => undefined, set: async () => undefined }),
+  }
   const ctx = {
+    get: (name) => (name === 'settingsScope' ? settingsScope : undefined),
     effect: (callback) => { disposers.push(callback()) },
     logger: { info() {}, warn() {} },
     slots: {
       inject: (name, callback) => { injected.push(name); return callback() },
       register: (options, component) => { registered.push({ options, component }); return () => undefined },
     },
-    settingsScope: { bind: (spec) => ({ spec, getSnapshot: () => ({ status: 'ready', value: {} }), subscribe: () => () => undefined, set: async () => undefined }) },
   }
   exports_.apply(ctx)
   assert.deepEqual(injected, ['conversation.input.right', 'settings.section'])
@@ -151,6 +154,28 @@ test('apply registers the composer seat and the settings section, then disposes 
   assert.equal(typeof registered[0].component, 'function')
   assert.equal(typeof registered[1].component, 'function')
   // Every effect returned a disposer (the third effect returns one from the observer).
+  for (const dispose of disposers) assert.equal(typeof dispose, 'function')
+  void require_
+})
+
+test('apply still mounts the composer seat on a host with no settings scope (0.2.x regression)', () => {
+  const { registrations, resolve } = loadClientBundle()
+  const exports_ = registrations[0].factory(resolve)
+  const disposers = []
+  const injected = []
+  // A host whose `ctx.get` answers nothing (or has none at all): the previous
+  // hard `inject: ['settingsScope']` left this half permanently unmounted, so the
+  // composer button never appeared. It must now degrade to "no settings page".
+  const ctx = {
+    effect: (callback) => { disposers.push(callback()) },
+    logger: { info() {}, warn() {} },
+    slots: {
+      inject: (name, callback) => { injected.push(name); return callback() },
+      register: () => () => undefined,
+    },
+  }
+  exports_.apply(ctx)
+  assert.deepEqual(injected, ['conversation.input.right'])
   for (const dispose of disposers) assert.equal(typeof dispose, 'function')
   void require_
 })
